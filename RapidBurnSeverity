@@ -1,0 +1,403 @@
+//This Earth Engine code calculates NDVI, burn ratios, and burn severity for the Rapid study area
+//This uses Sentinel 2 imagery that is topographically corrected
+//You will need to call the Sentinel image collection ('COPERNICUS/S2_SR_HARMONIZED'),
+////along with shapefiles for fires in the region and the study area
+//I used fire outlines from the NIFC 2024 burn area to find the Wapiti Fire outline
+
+////set up the style for shapefiles in the code
+var styling = {color: 'black', width: 4, fillColor: 'FF000000'};
+////get the outline of the wapiti fire 
+var wapiti = fires.filter(ee.Filter.eq('attr_Inc_2', 'WAPITI'));
+Map.addLayer(alderCr.style(styling), {}, 'alder creek');
+Map.addLayer(wapiti.style(styling), {}, 'wapiti outline', 0);
+//Map.addLayer(fires, {}, 'all fires', 0);
+////
+
+////set the map options for starting out
+Map.setCenter(-115.2916044513201, 44.19833969756167, 10);
+Map.setOptions('HYBRID');
+////
+
+////get a DEM for calculating slope for terrain correction
+var dem = ee.Image("USGS/SRTMGL1_003");
+//print('DEM', dem);
+////
+
+////Add in Sentinel 2 data and filter it by cloud cover and date
+//We have enough imagery to filter to only cloud free images and not need to cloud mask
+//This is where you can add in dates from different years by altering the .filterDate() arguments
+var sentinelCollection24 = sentinel.filterBounds(alderCr).filterDate('2024-10-09', '2024-10-15')
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_OVER_LAND_PERCENTAGE', 20));
+    
+var sentinelCollection23 = sentinel.filterBounds(alderCr).filterDate('2023-10-01', '2023-10-20')
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_OVER_LAND_PERCENTAGE', 8));
+////
+
+////rank the imagery we have available by quality as determined by cloud cover and cloud probability
+sentinelCollection24 = sentinelCollection24.map(function(img) {
+  var cldProb = img.select('MSK_CLDPRB');
+  var cldProbInv = cldProb.multiply(-1).rename('quality');
+  return img.addBands(cldProbInv);
+});
+
+sentinelCollection23 = sentinelCollection23.map(function(img) {
+  var cldProb = img.select('MSK_CLDPRB');
+  var cldProbInv = cldProb.multiply(-1).rename('quality');
+  return img.addBands(cldProbInv);
+});
+////
+
+////mosaic all of the sentinel imagery in the Alder Creek Watershedby quality as determined above,
+//////and change the band names for readability
+var alderCrComp24 = sentinelCollection24.qualityMosaic('quality')
+    .select(['B2','B3','B4','B8','B11','B12'], ['BLUE', 'GREEN', 'RED', 'NIR', 'SWIR1', 'SWIR2']);
+//Map.addLayer(alderCrComp, {bands:['RED','GREEN','BLUE'], min:0, max:2000}, 'composite', 0);
+//print('Alder Creek Composite', alderCrComp);
+
+var alderCrComp23 = sentinelCollection23.qualityMosaic('quality')
+    .select(['B2','B3','B4','B8','B11','B12'], ['BLUE', 'GREEN', 'RED', 'NIR', 'SWIR1', 'SWIR2']);
+//Map.addLayer(alderCrComp23, {bands:['RED','GREEN','BLUE'], min:0, max:2000}, 'composite 2023', 0);
+//print('Alder Creek Composite 2023', alderCrComp23);
+////
+
+////Clip the mosaiced image collection to the study area
+var alderCreekClipped2024 = alderCrComp24.clip(alderCr.geometry());
+//print('Alder Creek Clipped', alderCreekClipped);
+//Map.addLayer(alderCreekClipped, {bands: ['RED', 'GREEN', 'BLUE'], min: 0, max: 2000}, 'alder creek Sentiel 2024', 0);
+
+var alderCreekClipped2023 = alderCrComp23.clip(alderCr.geometry());
+//print('Alder Creek Clipped 2023', alderCreekClipped2023);
+//Map.addLayer(alderCreekClipped2023, {bands: ['RED', 'GREEN', 'BLUE'], min: 0, max: 2000}, 'alder creek Sentiel 2023', 0);
+////
+
+//get the projection of the alder creek watershed for exporting later
+print(alderCreekClipped2024.projection().crs(), 'crs');
+//
+
+////This is the start of the Sentinel Imagery terrain correction (Adapted from Open Geo Blog)
+//TC is done in two parts here. The IC section gets illumination and sets up the SCSc terrain correction later
+function topoCorr_IC_L4toL8(img){
+  
+  // Extract image metadata about solar position
+  var SZ_rad = ee.Image.constant(ee.Number(sentinelCollection24.first().get('MEAN_SOLAR_ZENITH_ANGLE'))).multiply(3.14159265359).divide(180).clip(alderCr.geometry().buffer(10000)); 
+  var SA_rad = ee.Image.constant(ee.Number(sentinelCollection24.first().get('MEAN_SOLAR_AZIMUTH_ANGLE')).multiply(3.14159265359).divide(180)).clip(alderCr.geometry().buffer(10000)); 
+  //print('azimuth angle radians', SA_rad);
+  
+  // Creat terrain layers
+  var slp = ee.Terrain.slope(dem).clip(alderCr.geometry().buffer(10000));
+  var slp_rad = ee.Terrain.slope(dem).multiply(3.14159265359).divide(180).clip(alderCr.geometry().buffer(10000));
+  var asp_rad = ee.Terrain.aspect(dem).multiply(3.14159265359).divide(180).clip(alderCr.geometry().buffer(10000));
+  //print('calculated slope', slp_rad);
+  //print('calculated aspect', asp_rad);
+  
+  // Calculate the Illumination Condition (IC)
+  // slope part of the illumination condition
+  var cosZ = SZ_rad.cos();
+  var cosS = slp_rad.cos();
+  var slope_illumination = cosS.expression("cosZ * cosS", 
+                                          {'cosZ': cosZ,
+                                           'cosS': cosS.select('slope')});
+  // aspect part of the illumination condition
+  var sinZ = SZ_rad.sin(); 
+  var sinS = slp_rad.sin();
+  var cosAziDiff = (SA_rad.subtract(asp_rad)).cos();
+  var aspect_illumination = sinZ.expression("sinZ * sinS * cosAziDiff", 
+                                           {'sinZ': sinZ,
+                                            'sinS': sinS,
+                                            'cosAziDiff': cosAziDiff});
+  // full illumination condition (IC)
+  var ic = slope_illumination.add(aspect_illumination);
+
+  // Add IC to original image
+  var img_plus_ic = ee.Image(img.addBands(ic.rename('IC')).addBands(cosZ.rename('cosZ')).addBands(cosS.rename('cosS')).addBands(slp.rename('slope')));
+  //print('IC modified Image', img_plus_ic);
+  return img_plus_ic;
+  }
+//
+////This is the SCSc correction that will help with mountains and shadows, you can check the differences by adding
+//the pre and post corrected imagery to the map (you may have to uncomment above to add the un-corrected image)
+function topoCorr_SCSc_L4toL8(img){
+    var img_plus_ic = img;
+    var mask1 = img_plus_ic.select('NIR').gt(-0.1);
+    var mask2 = img_plus_ic.select('slope').gte(5)
+                            .and(img_plus_ic.select('IC').gte(0))
+                            .and(img_plus_ic.select('NIR').gt(-0.1));
+    var img_plus_ic_mask2 = ee.Image(img_plus_ic.updateMask(mask2));
+    
+    var bandList = ['BLUE', 'GREEN', 'RED', 'NIR', 'SWIR1', 'SWIR2']; // Specify Bands to topographically correct
+    
+    function apply_SCSccorr(bandList){
+      var method = 'SCSc';
+      var out = img_plus_ic_mask2.select('IC', bandList).reduceRegion({
+      reducer: ee.Reducer.linearFit(), // Compute coefficients: a(slope), b(offset), c(b/a)
+      geometry: ee.Geometry(img.geometry().buffer(-5000)), // trim off the outer edges of the image for linear relationship 
+      scale: 10,
+      maxPixels: 1000000000
+      }); 
+      var out_a = ee.Number(out.get('scale'));
+      var out_b = ee.Number(out.get('offset'));
+      var out_c = ee.Number(out.get('offset')).divide(ee.Number(out.get('scale')));
+      
+      //apply the SCSc correction
+      var SCSc_output = img_plus_ic_mask2.expression("((image * (cosB * cosZ + cvalue)) / (ic + cvalue))", {
+        'image': img_plus_ic_mask2.select(bandList),
+        'ic': img_plus_ic_mask2.select('IC'),
+        'cosB': img_plus_ic_mask2.select('cosS'),
+        'cosZ': img_plus_ic_mask2.select('cosZ'),
+        'cvalue': out_c
+      });
+      
+      return ee.Image(SCSc_output);
+    }
+    
+    var img_SCSccorr = ee.Image(bandList.map(apply_SCSccorr)).addBands(img_plus_ic.select('IC'));
+    var bandList_IC = ee.List([bandList, 'IC']).flatten();
+    return img_SCSccorr.unmask(img_plus_ic.select(bandList_IC))
+                       .addBands(mask1.rename('initMask'))
+                       .addBands(mask2.rename('corrMask'));
+  }
+////
+
+////Now we apply the terrain correction to the clipped imagery and select only bands we want to look at in future steps
+alderCreekClipped2024 = topoCorr_IC_L4toL8(alderCreekClipped2024);
+alderCreekClipped2024 = topoCorr_SCSc_L4toL8(alderCreekClipped2024).select('BLUE', 'GREEN', 'RED', 'NIR', 'SWIR1', 'SWIR2');
+Map.addLayer(alderCreekClipped2024,{min:0,max:2000,bands:"RED,GREEN,BLUE"},"corrected 2024", 0);
+
+alderCreekClipped2023 = topoCorr_IC_L4toL8(alderCreekClipped2023);
+alderCreekClipped2023 = topoCorr_SCSc_L4toL8(alderCreekClipped2023).select('BLUE', 'GREEN', 'RED', 'NIR', 'SWIR1', 'SWIR2');
+Map.addLayer(alderCreekClipped2023,{min:0,max:2000,bands:"RED,GREEN,BLUE"},"corrected 2023", 0);
+////
+
+////calculate NDVI for pre and post burn
+var ndvi24 = alderCreekClipped2024.normalizedDifference(['NIR', 'RED'])
+                      .rename('NDVI24');
+var ndvi23 = alderCreekClipped2023.normalizedDifference(['NIR', 'RED'])
+                      .rename('NDVI23');
+//visually inspect the NDVIs on the map
+Map.addLayer(ndvi24, {min:-1, max: 1,  palette: ['red', 'white', 'green']}, 'NDVI 24', 0);
+Map.addLayer(ndvi23, {min:-1, max: 1,  palette: ['red', 'white', 'green']}, 'NDVI 23', 0);
+////
+
+////Calculate a normalized burn ratio for the TC imagery
+var nbr24 = alderCreekClipped2024.normalizedDifference(['NIR', 'SWIR2'])
+                      .rename('NBR24');
+//this prevents values of 0 in the nbr to prevent errors in later calculation steps
+nbr24 = nbr24.select('NBR24').expression(
+  'b("NBR24") == 0 ? 0.00001 : b("NBR24")');
+print('nbr 24', nbr24);
+Map.addLayer(nbr24, {min:-1, max: 1,  palette: ['red', 'white', 'green']}, 'NBR 2024', 0);
+
+var nbr23 = alderCreekClipped2023.normalizedDifference(['NIR', 'SWIR2'])
+                      .rename('NBR23');
+
+nbr23 = nbr23.select('NBR23').expression(
+  'b("NBR23") == 0 ? 0.00001 : b("NBR23")');
+print('nbr 2023', nbr23);
+Map.addLayer(nbr23, {min:-1, max: 1,  palette: ['red', 'white', 'green']}, 'NBR 2023', 0);
+////
+
+////get all of the NBRs into a single image to process later
+var combinedNBRs = nbr23.addBands(nbr24);
+print('combined NBRs', combinedNBRs);
+////
+
+////calculate the dNBR from the combined NBR raster (Howe et al., 2022)
+var dNBR = combinedNBRs.expression('(b("NBR23") - b("NBR24"))*1000').rename('dNBR');
+combinedNBRs = combinedNBRs.addBands(dNBR);
+print('combined NBRs w/ dNBR', combinedNBRs);
+Map.addLayer(dNBR, {}, 'dNBR', 0);
+////
+
+////Calculate RBR similarly
+var RBR = combinedNBRs.expression('b("dNBR")/(b("NBR23") + 1.001)').rename('RBR');
+combinedNBRs = combinedNBRs.addBands(RBR);
+print('combined NBRs/dNBR w/ RBR', combinedNBRs);
+Map.addLayer(RBR, {}, 'RBR', 0);
+////
+
+////Calculate RdNBR, the final step in burn severity calculation
+var RdNBR = combinedNBRs.expression(
+  '(abs(b("NBR23")) >= 0.001) ? (b("dNBR")/(pow(abs(b("NBR23")), 0.5))) : (b("dNBR")/(pow(0.001, 0.5))) ')
+  .rename('RdNBR');
+//This stops the values of RdNBR from moving into unreasonable ranges. You can set the upper and lower limits
+////by altering the numbers at the end of each line
+RdNBR = RdNBR.expression(
+  'b("RdNBR") > 2150 ? 2150' + //if greater than X, stop at X
+  ': b("RdNBR") < -1750 ? -1750' + //if less than Y, stop at Y
+  ': b("RdNBR")');
+print('RdNBR', RdNBR);    
+Map.addLayer(RdNBR, {min: -1000, max:1500, palette: ['teal', 'green', '#92f391', 'white', '#d291f3', '#f39191',  'red']}, 'RdNBR', 0);
+////
+
+combinedNBRs = combinedNBRs.addBands(RdNBR);
+
+////Assign indivual images for high, moderate, and low severity based on Howe et al.,2022
+var highSeverity = combinedNBRs.select('RdNBR').gt(634);
+var moderateSeverity = combinedNBRs.select('RdNBR').gt(315).and(combinedNBRs.select('RdNBR').lte(634));
+var lowSeverity = combinedNBRs.select('RdNBR').lte(315);
+
+//visualize severity in parts
+Map.addLayer(RdNBR.updateMask(highSeverity), {min:634, max: 1500, palette:['white', 'pink', 'red']}, 'High Severity', 0);
+Map.addLayer(RdNBR.updateMask(moderateSeverity), {min: 315, max: 633, palette:['green', '#92f391', 'white']}, 'Moderate Severity', 0);
+Map.addLayer(RdNBR.updateMask(lowSeverity), {min: -1000, max: 314, palette:['blue', 'cyan', 'teal']}, 'Low Severity', 0);
+
+//find the scale of the nbr imagery for quick math in plotting
+var scale = nbr24.projection().nominalScale();
+
+////create a histogram of nbr values to see how things are distributed
+//Heads up: plotting is neither easy nor straightforward in GEE. Check out mygeoblog.com and Stack for help with this
+var NBR24hist = ui.Chart.image.histogram({
+  image: nbr24.select('NBR24'),
+  region: alderCr.geometry(),
+  scale: scale,
+  minBucketWidth:0.001
+});
+print(NBR24hist);
+
+var NBR23hist = ui.Chart.image.histogram({
+  image: nbr23.select('NBR23'),
+  region: alderCr.geometry(),
+  scale: scale,
+  minBucketWidth:0.001
+});
+print(NBR23hist);
+
+//plot a histogram of the RdNBR image to check its distribution
+var RdNBRhist = ui.Chart.image.histogram({
+  image: RdNBR,
+  region: alderCr.geometry(),
+  scale: scale,
+  maxBuckets: 4000
+}).setOptions({histogram: {minValue: -1800, maxValue: 2200}});
+
+print(RdNBRhist);
+////
+
+
+
+////This is an optional section for creating a legend for your RdNBR image with the same palette used in visualization
+//var palette = ['teal', 'green', '#92f391', 'white', '#d291f3', '#f39191',  'red'];
+//var vis = {min: -1000, max:1500, palette: palette};
+//
+//var legend = ui.Panel({
+//  style: {
+//    position: 'bottom-left',
+//    padding: '8px 15px'
+//  }
+//});
+//
+//var title = ui.Label({
+//  value: 'Burn Severity',
+//  style: {
+//    fontWeight: 'bold',
+//    fontSize: '18px',
+//    margin: '0 0 4px 0',
+//    padding: '0'
+//  }
+//});
+//
+//legend.add(title);
+//
+//var lon = ee.Image.pixelLonLat().select('latitude');
+//var gradient = lon.multiply((vis.max-vis.min)/100).add(vis.min);
+//var legendImage = gradient.visualize(vis);
+//
+//var panel = ui.Panel({
+//  widgets: [
+//    ui.Label('High ('+vis['max']+' +)')],
+//});
+//
+//legend.add(panel);
+//
+//var thumbnail = ui.Thumbnail({
+//  image: legendImage,
+//  params: {bbox: '0,0,10,100', dimensions: '10x200'},
+//  style: {padding: '1px', position: 'bottom-center'}
+//});
+//
+//legend.add(thumbnail);
+//
+//var panel = ui.Panel({
+//  widgets: [
+//    ui.Label('Low ('+vis['min']+' -)')],
+//});
+//
+//legend.add(panel);
+//Map.add(legend);
+////
+
+
+
+////Export all of the imagery you want to get out of this code
+//Export.image.toDrive({
+//  image: ndvi23,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidNDVI2023',
+//  description: 'NDVI23Export',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
+//Export.image.toDrive({
+//  image: ndvi24,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidNDVI2024',
+//  description: 'NDVI24Export',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
+//Export.image.toDrive({
+//  image: nbr23,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidNBR2023',
+//  description: 'NBR23Export',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
+//Export.image.toDrive({
+//  image: nbr24,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidNBR2024',
+//  description: 'NBR24Export',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
+//Export.image.toDrive({
+//  image: RdNBR,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidRdNBR2023',
+//  description: 'RdNBR23Export',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
+//Export.image.toDrive({
+//  image: combinedNBRs,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidCalculatedBurnRatios',
+//  description: 'combinedNBRsExport',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
+//Export.image.toDrive({
+//  image: alderCreekClipped2023,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidSurfaceReflectance2023',
+//  description: '2023SentinelExport',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
+//Export.image.toDrive({
+//  image: alderCreekClipped2024,
+//  folder: 'WapitiLandcover',
+//  fileNamePrefix: 'RapidSurfaceReflectance2024',
+//  description: '2024SentinelExport',
+//  region: alderCr.geometry(),
+//  scale: 20,
+//  crs: 'EPSG: 4326'
+//});
