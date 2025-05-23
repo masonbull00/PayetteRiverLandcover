@@ -1,0 +1,614 @@
+//This is the code for analyzing all of landsat 5 for the payette watershed
+//It works nearly identically to the Nellie Juan Classifier, but there are some differences
+//For more detail of what each line does, check out the Nellie Juan classifier on my Github (masonbull00)
+
+//You will notice that there a lot of commented out 'print' commands. This code takes a while to run
+////and printing when it is not necessary really slows it down. Start printing things if you are getting errors to
+////see where they are occuring.
+
+
+//You will need training data for the classes you are analyzing,
+////a watershed outline and waterbodies shapfile,
+///and a shapefile of the burned areas in the watershed
+Map.setCenter(-115.0994, 44.1006, 12);
+Map.setOptions({mapTypeId: 'HYBRID'});
+
+// Add ROI and set your date to find imagery
+var roi = ee.Geometry.Point(-115.0994, 44.1006); // Payette Watershed
+var date_i = '1983-06-01'; // set initial date (YYYY-MM-DD)
+var date_f = '2012-10-31'; // Set final date (YYY-MM-DD)
+
+//add an outline of the Payette Watershed to visualize the study area
+var styling = {color: 'black', width: 4, fillColor: 'FF000000'};
+Map.addLayer(pt_wtrshd.style(styling), null, 'pt_wtrshd');
+
+/////////////////////////////////////////////////////////////////
+/////////////Landsat 5 Workflow for the Payette//////////////////
+/////////////////////////////////////////////////////////////////
+
+var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .filterDate(date_i, date_f)
+  .filter(ee.Filter.calendarRange(8, 10, 'month'))
+  .filterBounds(roi)
+  .select('SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL')
+  .filter(ee.Filter.lte('CLOUD_COVER_LAND', 25));
+//print('l5', l5);
+
+//this applies a QA bitmask to filter out pixels with excessive clouds and shadows
+//this function is varied from Spatial Thoughts: https://spatialthoughts.com/2021/08/19/qa-bands-bitmasks-gee/
+var qaFunc = function(image){
+  var bitwiseExtract = function(input, fromBit, toBit) {
+    var maskSize = ee.Number(1).add(toBit).subtract(fromBit);
+    var mask = ee.Number(1).leftShift(maskSize).subtract(1);
+    return input.rightShift(fromBit).bitwiseAnd(mask);
+  };
+
+  var qaBand = image.select('QA_PIXEL');
+  var cirrus = bitwiseExtract(qaBand, 14, 15).neq(3);
+  //var shadow = bitwiseExtract(qaBand, 10, 11).lte(2); shadow needs taken out as it is too aggressive with dark spots
+  var cloud = bitwiseExtract(qaBand, 8, 9).neq(3);
+  var bitMask = cirrus.and(cloud);
+  return image.mask(bitMask);
+};
+
+var checkCRS = l5.first().projection().crs();
+//print('l5 crs', checkCRS);
+
+var checkProj = l5.first().projection();
+
+//add a visualization parameter for the landsat imagery to display in the map if wanted
+var l5visParams = {bands: ['B3', 'B2', 'B1'], min: 0, max: 20000};
+
+//add SRTM data, clip it to the the Payette, select only the elevation band, and then derive slope and aspect as separate images
+var DEM = ee.Image("NASA/NASADEM_HGT/001").clip(pt_wtrshd.geometry()).select('elevation').reproject(checkProj);
+var slope = ee.Terrain.slope(DEM);
+var aspect = ee.Terrain.aspect(DEM);
+//print('Elevation', DEM);
+//print('Slope', slope);
+//print('Aspect', aspect);
+
+
+var demClip = pt_wtrshd;
+
+var tmEtmBands = ['SR_B1',   'SR_B2',    'SR_B3',  'SR_B4',  'SR_B5',    'SR_B7'];
+var defBands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'];
+
+var renameBands = function(image){
+  return image.select(['blue_TC', 'green_TC', 'red_TC', 'nir_TC', 'swir1_TC', 'swir2_TC'])
+  .rename(['B2', 'B3', 'B4', 'B5', 'B6', 'B7']);
+};
+
+// create a function to clip each image in the image collection to the Payette
+var clipping = function(image) {
+  return image.clip(pt_wtrshd);
+};
+
+// create a function to add the DEM elevation, slope, and aspect bands to the landsat images
+var addDEM = function(image){
+  return image.addBands(DEM).addBands(slope).addBands(aspect);
+};
+
+//create a water mask using NHD waterbodies polygons
+var ptWaterImg = pt_water.reduceToImage(['fcode'], ee.Reducer.sum()).clip(pt_wtrshd.geometry());
+var fireImg = fire.reduceToImage(['Shape_Area'], ee.Reducer.sum()).clip(pt_wtrshd.geometry()); //<- a key difference for the Payette is the addition of a fire mask to get rid of historic burns
+var inverseFire = fireImg.not();
+var inverseWater = ptWaterImg.not();
+
+//create a function to apply the water mask to the composited imagery
+var applyMask = function(image){
+  var i = image.updateMask(inverseFire); 
+  return i.updateMask(inverseWater);
+};
+
+
+//create a function to look over imagery and only select the most snow free images,
+//this is to account for early snowfall and filter out those images with excess snow
+
+//this function will count the number of snow free pixels
+var NDSIth = function(image){
+  var getNDSI = image.select('NDSI').gte(0.4).selfMask().rename('NDSIth');
+  var pixelCount = getNDSI.reduceRegion({reducer: ee.Reducer.count(), geometry: pt_wtrshd.geometry(), scale: 30, bestEffort: true, maxPixels: 6700000});
+  return image.addBands(getNDSI).set('NDSIcount', pixelCount.get('NDSIth'));
+};
+
+
+var l5cloudFree = l5.map(qaFunc);
+//print('l5 cloud free', l5cloudFree);
+
+var l5cor = l5cloudFree.select(tmEtmBands, defBands);
+//print('l5cor', l5cor);
+
+//funtion to compute radians from degrees
+function radians(img) {
+  return img.toFloat().multiply(Math.PI).divide(180);}
+//Get DEM Slope and Aspect in radians
+var SLPrads = radians(slope);
+var ASPrads = radians(aspect);
+
+//function to do the terrain correction
+var scscTCl5 = function(img) {
+  var outImage = img.select([]);
+  
+  //Get the footprint image of the study area
+  var footprint = ee.Geometry.Polygon(ee.Number(ee.List(img.get('system:footprint'))));
+
+  //VARIABLES FROM METADATA
+  var AZ = ee.Number(img.get('SUN_AZIMUTH'));
+  var ZE = ee.Number(img.get('SUN_ELEVATION'));
+  var AZ_R = radians(ee.Image(AZ));
+  var ZE_R = radians(ee.Image(ZE));
+  
+  //CALCULATE LOCAL ILLUMINATION, COS OF THE SLOPE, AND COS OF THE ZENITH ANGLE
+  var IL = AZ_R.subtract(ASPrads).cos().multiply(SLPrads.sin()).multiply(ZE_R.sin())
+  .add(ZE_R.cos().multiply(SLPrads.cos()));
+  var cos_ZE = ZE_R.cos();
+  var cos_SLP = SLPrads.cos();
+  
+
+  //C for the blue band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultBlue = clippedImg.select('constant', 'constant_1', 'blue')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var blueC = (ee.Array(resultBlue.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultBlue.get('coefficients')).get([1,0]));
+  var blueCorr = ((cos_ZE.multiply(cos_SLP)).add(blueC)).divide(IL.add(blueC));
+
+  
+  //C for the green band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultGreen = clippedImg.select('constant', 'constant_1', 'green')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var greenC = (ee.Array(resultGreen.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultGreen.get('coefficients')).get([1,0]));
+  var greenCorr = ((cos_ZE.multiply(cos_SLP)).add(greenC)).divide(IL.add(greenC));
+  
+  //C for the red band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultRed = clippedImg.select('constant', 'constant_1', 'red')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var redC = (ee.Array(resultRed.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultRed.get('coefficients')).get([1,0]));
+  var redCorr = ((cos_ZE.multiply(cos_SLP)).add(redC)).divide(IL.add(redC));
+  
+  //C for the nir band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultNir = clippedImg.select('constant', 'constant_1', 'nir')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var nirC = (ee.Array(resultNir.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultNir.get('coefficients')).get([1,0]));
+  var nirCorr = ((cos_ZE.multiply(cos_SLP)).add(nirC)).divide(IL.add(nirC));
+  
+  //C for the swir1 band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultSwir1 = clippedImg.select('constant', 'constant_1', 'swir1')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var swir1C = (ee.Array(resultSwir1.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultSwir1.get('coefficients')).get([1,0]));
+  var swir1Corr = ((cos_ZE.multiply(cos_SLP)).add(swir1C)).divide(IL.add(swir1C));
+  
+  //C for the swir2 band
+  var clippedImg = img.addBands(1).addBands(IL);
+  var resultSwir2 = clippedImg.select('constant', 'constant_1', 'swir2')
+    .reduceRegion({
+      reducer: ee.Reducer.linearRegression(2,1),
+      geometry: footprint,
+      scale: 30,
+      maxPixels: 2e9
+      });
+  var swir2C = (ee.Array(resultSwir2.get('coefficients')).get([0,0]))
+  .divide(ee.Array(resultSwir2.get('coefficients')).get([1,0]));
+  var swir2Corr = ((cos_ZE.multiply(cos_SLP)).add(swir2C)).divide(IL.add(swir2C));
+  
+  //IMAGE CORRECTION
+  var InImg2 = img.multiply(0.0001);
+  
+  var blueBand = InImg2.select('blue').multiply(blueCorr);
+  //Map.addLayer(blueBand);
+  var greenBand = InImg2.select('green').multiply(greenCorr);
+  var redBand = InImg2.select('red').multiply(redCorr);
+  var nirBand = InImg2.select('nir').multiply(redCorr);
+  var swir1Band = InImg2.select('swir1').multiply(swir1Corr);
+  var swir2Band = InImg2.select('swir2').multiply(swir2Corr);
+  
+  var img_TC = img.select().addBands([blueBand, greenBand, redBand, nirBand, swir1Band, swir2Band]);
+  //print('img_TC', img_TC)
+  
+  //ADJUST VALUE RANGE (REFLECTANCE BETWEEN 0 AND 1)
+  var img_TC1 = ((img_TC.multiply(10000)).int16());//.multiply(0.0001);
+    
+  outImage = outImage.addBands(img_TC1
+  .select([0,1,2,3,4,5],['blue_TC', 'green_TC', 'red_TC', 'nir_TC', 'swir1_TC', 'swir2_TC']));
+  return outImage;
+};
+
+var l5CorCol = l5cor.map(scscTCl5);
+//print('corCol', l5CorCol);
+
+var renameBands = function(image){
+  return image.select(['blue_TC', 'green_TC', 'red_TC', 'nir_TC', 'swir1_TC', 'swir2_TC'])
+  .rename(['B1', 'B2', 'B3', 'B4', 'B5', 'B7']);
+};
+
+var l5renamed = l5CorCol.map(renameBands);
+//print('RENAMED L5', l5renamed);
+
+// Apply clipping function to l8 data
+var l5_clip = l5renamed.map(clipping);
+//print('l5 clipped', l5_clip);
+
+// create a function to add the DEM elevation, slope, and aspect bands to the landsat images
+var addDEM = function(image){
+  return image.addBands(DEM).addBands(slope).addBands(aspect);
+};
+
+//apply the addDEM function to each image in the collection
+var l5DEM = l5_clip.map(addDEM);
+
+//apply the water masking function to the composited imagery
+var l5Masked = l5DEM.map(applyMask);
+
+//create a function to generate an NDSI and NDVI on the imagery
+var createNDSIl5 = function(image){
+  var NDSI = image.normalizedDifference(['B2', 'B5']).rename('NDSI');
+  var NDVI = image.normalizedDifference(['B4', 'B3']).rename('NDVI');
+  return image.addBands(NDSI).addBands(NDVI);
+};
+
+//apply the NDSI and NDVI creation function to the imagery
+var l5NDI = l5Masked.map(createNDSIl5);
+//print('L5 + Idices', l5NDI);
+
+
+//map the function to get the count of pixels that are snow over the image collection
+var l5SnowCount = l5NDI.map(NDSIth);
+//print('l5 w snowy pixel count', l5SnowCount);
+
+//this function will pass over the image collection and only keep images with a defined number of 
+//snow free pixels
+var l5SnowFree = l5SnowCount.filter(ee.Filter.lte('NDSIcount', 30000));
+l5SnowFree = l5SnowFree.select('B1', 'B2', 'B3', 'B4', 'B5', 'B7', 
+  'elevation', 'slope', 'aspect', 'NDSI', 'NDVI');
+//print('l5 snow free images', l5SnowFree);
+
+//create an empty list to add accuracies to after classification
+var accuraciesL5 = ee.List([]);
+
+//grab images for a single year from the snow free collection to make an image from for processing  
+//using the new classificaiton technique, then get the median value of the imagery to get to a single 
+//image, regardless of there being multiple images in a yearvar l7composite2014 = l7SnowFree.filter(ee.Filter.date('2014-01-01', '2014-12-31')).median();
+var l5composite1984 = l5SnowFree.filter(ee.Filter.date('1984-01-01', '1984-12-31')).median();
+//print('1984 image composite', l5composite1984);
+var l5composite1985 = l5SnowFree.filter(ee.Filter.date('1985-01-01', '1985-12-31')).median();
+//print('1985 image composite', l5composite1985);
+var l5composite1986 = l5SnowFree.filter(ee.Filter.date('1986-01-01', '1986-12-31')).median();
+//print('1986 image composite', l5composite1986);
+var l5composite1987 = l5SnowFree.filter(ee.Filter.date('1987-01-01', '1987-12-31')).median();
+//print('1987 image composite', l5composite1987);
+var l5composite1988 = l5SnowFree.filter(ee.Filter.date('1988-01-01', '1988-12-31')).median();
+//print('1988 image composite', l5composite1988);
+var l5composite1989 = l5SnowFree.filter(ee.Filter.date('1989-01-01', '1989-12-31')).median();
+//print('1989 image composite', l5composite1989);
+var l5composite1990 = l5SnowFree.filter(ee.Filter.date('1990-01-01', '1990-12-31')).median();
+//print('1990 image composite', l5composite1990);
+var l5composite1991 = l5SnowFree.filter(ee.Filter.date('1991-01-01', '1991-12-31')).median();
+//print('1991 image composite', l5composite1991);
+var l5composite1992 = l5SnowFree.filter(ee.Filter.date('1992-01-01', '1992-12-31')).median();
+//print('1992 image composite', l5composite1992);
+var l5composite1993 = l5SnowFree.filter(ee.Filter.date('1993-01-01', '1993-12-31')).median();
+//print('1993 image composite', l5composite1993);
+var l5composite1994 = l5SnowFree.filter(ee.Filter.date('1994-01-01', '1994-12-31')).median();
+//print('1994 image composite', l5composite1994);
+var l5composite1995 = l5SnowFree.filter(ee.Filter.date('1995-01-01', '1995-12-31')).median();
+//print('1995 image composite', l5composite1995);
+var l5composite1996 = l5SnowFree.filter(ee.Filter.date('1996-01-01', '1996-12-31')).median();
+//print('1996 image composite', l5composite1996);
+var l5composite1997 = l5SnowFree.filter(ee.Filter.date('1997-01-01', '1997-12-31')).median();
+//print('1997 image composite', l5composite1997);
+var l5composite1998 = l5SnowFree.filter(ee.Filter.date('1998-01-01', '1998-12-31')).median();
+//print('1998 image composite', l5composite1998);
+var l5composite1999 = l5SnowFree.filter(ee.Filter.date('1999-01-01', '1999-12-31')).median();
+//print('1999 image composite', l5composite1999);
+var l5composite2000 = l5SnowFree.filter(ee.Filter.date('2000-01-01', '2000-12-31')).median();
+//print('2000 image composite', l5composite2000);
+var l5composite2001 = l5SnowFree.filter(ee.Filter.date('2001-01-01', '2001-12-31')).median();
+//print('2001 image composite', l5composite2001);
+var l5composite2002 = l5SnowFree.filter(ee.Filter.date('2002-01-01', '2002-12-31')).median();
+//print('2002 image composite', l5composite2002);
+var l5composite2003 = l5SnowFree.filter(ee.Filter.date('2003-01-01', '2003-12-31')).median();
+//print('2003 image composite', l5composite2003);
+var l5composite2004 = l5SnowFree.filter(ee.Filter.date('2004-01-01', '2004-12-31')).median();
+//print('2004 image composite', l5composite2004);
+var l5composite2005 = l5SnowFree.filter(ee.Filter.date('2005-01-01', '2005-12-31')).median();
+//print('2005 image composite', l5composite2005);
+var l5composite2006 = l5SnowFree.filter(ee.Filter.date('2006-01-01', '2006-12-31')).median();
+//print('2006 image composite', l5composite2006);
+var l5composite2007 = l5SnowFree.filter(ee.Filter.date('2007-01-01', '2007-12-31')).median();
+//print('2007 image composite', l5composite2007);
+var l5composite2008 = l5SnowFree.filter(ee.Filter.date('2008-01-01', '2008-12-31')).median();
+//print('2008 image composite', l5composite2008);
+var l5composite2009 = l5SnowFree.filter(ee.Filter.date('2009-01-01', '2009-12-31')).median();
+//print('2009 image composite', l5composite2009);
+var l5composite2010 = l5SnowFree.filter(ee.Filter.date('2010-01-01', '2010-12-31')).median();
+//print('2010 image composite', l5composite2010);
+var l5composite2011 = l5SnowFree.filter(ee.Filter.date('2011-01-01', '2011-12-31')).median();
+//print('2011 image composite', l5composite2011);
+var l5composite2012 = l5SnowFree.filter(ee.Filter.date('2012-01-01', '2012-12-31')).median();
+//print('2012 image composite', l5composite2012);
+
+//Introduce Classes from 1986 layer for the classification. Classes are: 1: Rock, 2: Dense Forest,
+//3: Transitional Forest, 4: Riparian Shrub, 5: Veg talus, 6: Tree Talus
+//This class list includes water, but because we have a water mask this class can be removed
+var classes1984NW = classes84.filter(ee.Filter.inList('Class', [1, 2, 3, 4, 5, 6]));//.filter(
+  //ee.Filter.lte('random', 0.8));
+
+////////////////////
+//You may find it helpful to play with the amount of training data you let into the classifier.
+//I have that line commented out above, but play with it and see how/if your accuracy changes
+///////////////////
+
+
+//create a label for use in the classifier
+var label = 'Class';
+
+
+//define the important bands to use in the classification 
+var l5bands = ['B1', 'B2', 'B3', 'B4', 'B5', 'B7', 'elevation',
+  'slope', 'aspect', 'NDSI', 'NDVI'];
+  
+  
+//This function will create training data for each image using the previously created split
+//in the class data 
+function classifyDataL5(image, points, year) {
+  var trainingPoints = points.filter(ee.Filter.lte('random', 0.8)); //<- if you change the amount of training data above you will need
+  var validationPoints = points.filter(ee.Filter.gt('random', 0.8));// to adjust this to be 80% of however much data you allowed in
+  
+  var NDVI = image.select('NDVI');
+    
+  //sample the training data over the imagery
+  var training = image.reduceRegions({
+    collection: trainingPoints,
+    reducer: ee.Reducer.first(),
+    scale: 30
+  }).filter(ee.Filter.neq('B1', null)).filter(ee.Filter.neq('slope', null))
+  .filter(ee.Filter.neq('B2', null))
+  .filter(ee.Filter.neq('B3', null)).filter(ee.Filter.neq('B4', null))
+  .filter(ee.Filter.neq('B5', null)).filter(ee.Filter.neq('B6', null))
+  .filter(ee.Filter.neq('B7', null))
+  .filter(ee.Filter.neq('NDVI', null)).filter(ee.Filter.neq('NDSI', null));
+
+  //create and train an empty classifer
+  var classifier = ee.Classifier.smileRandomForest(100)
+  .train({
+    features: training,
+    classProperty: 'Class',
+    inputProperties: image.bandNames()
+  });
+  
+  //get classifier expanations
+  var importance = ee.Dictionary(classifier.explain()
+  .get('importance', 'outOfBagErrorEstimate'));
+  
+  //print('importance ' + year, importance);
+  var totalImportance = importance.values().reduce(ee.Reducer.sum());
+  
+  var importancePercentage = importance.map(function (band, importance) {
+  return ee.Number(importance).divide(totalImportance).multiply(100)}); 
+  
+  print('importance Percentage ' + year, importancePercentage);
+  
+  //classify the images
+  var classifiedImage = image.classify(classifier);
+  
+  var classedVisParams = {min: 1, max: 6, 
+  'palette': ['45414E', '0E5B07', '16E810', '152AF5', '7D5108', 'ffd37f']
+  };
+  //add the classified layer to the map
+  Map.addLayer(classifiedImage, classedVisParams, 'L5 ' + year, 0);
+  
+  //use the map to get accuracy metrics from validation data created earlier
+  var testing = classifiedImage.sampleRegions({
+    collection: validationPoints,
+    properties: ['Class'],
+    scale: 30,
+    geometries: true
+  });
+  
+      //find out which points are misclassified and display them
+  var misclassifiedl5 = testing.filter(ee.Filter.notEquals({ 
+    leftField: 'Class', rightField: 'classification'
+  }));
+  
+      
+  var pointStyle = ee.Dictionary({
+    1: {color: 'red', fillColor: '45414E', pointShape: 'circle', pointSize: 5},
+    2: {color: 'red', fillColor: '0E5B07', pointShape: 'circle', pointSize: 5},
+    3: {color: 'red', fillColor: '16E810', pointShape: 'circle', pointSize: 5},
+    4: {color: 'red', fillColor: '152AF5', pointShape: 'circle', pointSize: 5},
+    5: {color: 'red', fillColor: '7D5108', pointShape: 'circle', pointSize: 5},
+    6: {color: 'red', fillColor: 'ffd37f', pointShape: 'circle', pointSize: 5}
+  });
+  
+  misclassifiedl5 = misclassifiedl5.map(function(feature){
+    return feature.set('style', pointStyle.get(feature.get('Class')));
+  });
+  //print('Misclassified Points ' + year, misclassifiedl5);
+  Map.addLayer(misclassifiedl5.style({styleProperty: 'style'}), {}, 'Misclassified Points ' + year, 0);
+  
+  //create a confusion matrix for the data
+  var testingConfusionMatrix = testing.errorMatrix('Class', 'classification');
+  //print the matrices
+  print('confusion matrix l8 ' + year, testingConfusionMatrix);
+  print('test accuracy l8 ' + year, testingConfusionMatrix.accuracy());
+  //print('Users Accuracy '+year, testingConfusionMatrix.consumersAccuracy());
+  //print('Producers Accuracy '+year, testingConfusionMatrix.producersAccuracy());
+  //print('Kappa '+year, testingConfusionMatrix.kappa());
+  
+  var accuracy = testingConfusionMatrix.accuracy();
+  accuraciesL5 = accuraciesL5.add(accuracy);
+
+    //This creates a histogram so you can see how many pixels are being classified as each class.
+  //This isn't necessary, but it helps to visualize how your classifier is working
+  var histo = ui.Chart.image.histogram({image: classifiedImage,
+                                        region: pt_wtrshd.geometry(),
+                                        scale: 30
+  });
+  print('class histogram ' + year, histo);
+
+  
+  //export the generate error matrix to Google Drive in a specified folder
+  //(the matrix needs to be converted to a featureCollection first)
+
+  //export the generated error matrix to Google Drive in a specified folder
+  //(the matrix needs to be converted to a featureCollection first)
+  
+  ////this step converts the error matrix into an array, and then a callable feature
+  //var exportMatrix = ee.Feature(null, {matrix: testingConfusionMatrix.array()});
+  //Export.table.toDrive({
+  //  collection: ee.FeatureCollection(exportMatrix),
+  //  description: 'L5_Confusion_Matrix_for_' + year,
+  //  folder: 'ErrorMatrix',
+  //  fileNamePrefix: 'L5Matrix' + year,
+  //  fileFormat: 'CSV'
+  //});
+  //
+  ////export the feature of class areas 
+  //Export.table.toDrive({
+  //  collection: ee.FeatureCollection(classAreaFeature),
+  //  description: 'L5_Classes_Areas_for_' + year,
+  //  folder: 'ClassArea',
+  //  fileNamePrefix: 'L5ClassArea' + year,
+  //  fileFormat: 'CSV'
+  //});
+  //
+  ////export imagery to google drive
+  //Export.image.toDrive({
+  //  image: classifiedImage,
+  //  description: 'L5_FM_Classified_Image' + year,
+  //  folder: 'PayetteGEEOutputs',
+  //  fileNamePrefix: 'L5_PT_FM_ClassImg' + year,
+  //  scale: 30,
+  //  fileFormat: 'GeoTIFF',
+  //  region: pt_wtrshd.geometry(),
+  //  crs: 'EPSG:32611'
+  //});
+    //export ndvi to google drive
+  //Export.image.toDrive({
+  //  image: NDVI,
+  //  description: 'L5_FM_NDVI' + year,
+  //  folder: 'PayetteGEEOutputs',
+  //  fileNamePrefix: 'L5_PTFM_NDVI' + year,
+  //  scale: 30,
+  //  maxPixels: 9e7,
+  //  fileFormat: 'GeoTIFF',
+  //  region: pt_wtrshd.geometry(),
+  //  crs: 'EPSG:32611'
+  //});
+  //Export a classified image to an asset
+  //Export.image.toAsset({
+  //  image: classifiedImage,
+  //  description: 'classified' + year + 'toAsset',
+  //  assetId: 'projects/boise-state-bull-thesis-work/assets/PT_FM_classified' + year,
+  //  region: pt_wtrshd.geometry(),
+  //  scale: 30,
+  //  crs: 'EPSG:32611'
+  //});
+
+
+}
+
+
+//run the classifier function on the composited imagery from each year,
+//outputs an image on the map of the classification as well as a confusion
+//matrix and accuracy in the console. Also adds in the corresponding year's Landsat image
+Map.addLayer(l5composite1984, l5visParams, 'Landsat 5 1984', 0);
+classifyDataL5(l5composite1984, classes1984NW, '1984');
+Map.addLayer(l5composite1985, l5visParams, 'Landsat 5 1985', 0);
+classifyDataL5(l5composite1985, classes1984NW, '1985');
+Map.addLayer(l5composite1986, l5visParams, 'Landsat 5 1986', 0);
+classifyDataL5(l5composite1986, classes1984NW, '1986');
+Map.addLayer(l5composite1987, l5visParams, 'Landsat 5 1987', 0);
+classifyDataL5(l5composite1987, classes1984NW, '1987');
+Map.addLayer(l5composite1988, l5visParams, 'Landsat 5 1988', 0);
+classifyDataL5(l5composite1988, classes1984NW, '1988');
+Map.addLayer(l5composite1989, l5visParams, 'Landsat 5 1989', 0);
+classifyDataL5(l5composite1989, classes1984NW, '1989');
+Map.addLayer(l5composite1990, l5visParams, 'Landsat 5 1990', 0);
+classifyDataL5(l5composite1990, classes1984NW, '1990');
+Map.addLayer(l5composite1991, l5visParams, 'Landsat 5 1991', 0);
+classifyDataL5(l5composite1991, classes1984NW, '1991');
+Map.addLayer(l5composite1992, l5visParams, 'Landsat 5 1992', 0);
+classifyDataL5(l5composite1992, classes1984NW, '1992');
+Map.addLayer(l5composite1993, l5visParams, 'Landsat 5 1993', 0);
+classifyDataL5(l5composite1993, classes1984NW, '1993');
+Map.addLayer(l5composite1994, l5visParams, 'Landsat 5 1994', 0);
+classifyDataL5(l5composite1994, classes1984NW, '1994');
+Map.addLayer(l5composite1995, l5visParams, 'Landsat 5 1995', 0);
+classifyDataL5(l5composite1995, classes1984NW, '1995');
+Map.addLayer(l5composite1996, l5visParams, 'Landsat 5 1996', 0);
+classifyDataL5(l5composite1996, classes1984NW, '1996');
+Map.addLayer(l5composite1997, l5visParams, 'Landsat 5 1997', 0);
+classifyDataL5(l5composite1997, classes1984NW, '1997');
+Map.addLayer(l5composite1998, l5visParams, 'Landsat 5 1998', 0);
+classifyDataL5(l5composite1998, classes1984NW, '1998');
+Map.addLayer(l5composite1999, l5visParams, 'Landsat 5 1999', 0);
+classifyDataL5(l5composite1999, classes1984NW, '1999');
+Map.addLayer(l5composite2000, l5visParams, 'Landsat 5 2000', 0);
+classifyDataL5(l5composite2000, classes1984NW, '2000');
+Map.addLayer(l5composite2001, l5visParams, 'Landsat 5 2001', 0);
+classifyDataL5(l5composite2001, classes1984NW, '2001');
+Map.addLayer(l5composite2002, l5visParams, 'Landsat 5 2002', 0);
+classifyDataL5(l5composite2002, classes1984NW, '2002');
+Map.addLayer(l5composite2003, l5visParams, 'Landsat 5 2003', 0);
+classifyDataL5(l5composite2003, classes1984NW, '2003');
+Map.addLayer(l5composite2004, l5visParams, 'Landsat 5 2004', 0);
+classifyDataL5(l5composite2004, classes1984NW, '2004');
+Map.addLayer(l5composite2005, l5visParams, 'Landsat 5 2005', 0);
+classifyDataL5(l5composite2005, classes1984NW, '2005');
+Map.addLayer(l5composite2006, l5visParams, 'Landsat 5 2006', 0);
+classifyDataL5(l5composite2006, classes1984NW, '2006');
+Map.addLayer(l5composite2007, l5visParams, 'Landsat 5 2007', 0);
+classifyDataL5(l5composite2007, classes1984NW, '2007');
+Map.addLayer(l5composite2008, l5visParams, 'Landsat 5 2008', 0);
+classifyDataL5(l5composite2008, classes1984NW, '2008');
+Map.addLayer(l5composite2009, l5visParams, 'Landsat 5 2009', 0);
+classifyDataL5(l5composite2009, classes1984NW, '2009');
+Map.addLayer(l5composite2010, l5visParams, 'Landsat 5 2010', 0);
+classifyDataL5(l5composite2010, classes1984NW, '2010');
+Map.addLayer(l5composite2011, l5visParams, 'Landsat 5 2011', 0);
+classifyDataL5(l5composite2011, classes1984NW, '2011');
+
+
+var listOfYearsL5 = ['1984', '1985', '1986', '1987', '1988', '1989', '1990', '1991', '1992', '1993',
+                     '1994', '1995', '1996', '1997', '1998', '1999', '2000', '2001', '2002', '2003',
+                     '2004', '2005', '2006', '2007', '2008', '2009', '2010', '2011'];
+print('list of accuracies Landsat 5', accuraciesL5);
+var accuracyChartL5 = ui.Chart.array.values({array: accuraciesL5, axis: 0, xLabels: listOfYearsL5})
+                    .setOptions({title: 'Accuracy of Classification Over Time',
+                      trendlines: {0:{}}
+                    });
+print('accuracy chart L5', accuracyChartL5);
